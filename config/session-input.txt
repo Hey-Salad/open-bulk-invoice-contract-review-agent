@@ -1,0 +1,5 @@
+Please start a bulk invoice and contract review setup check.
+
+We have not uploaded the invoice PDFs, contract PDFs, policy document, purchase orders, or payment records yet.
+
+Use live web search only if useful for general review best practices, not to invent our internal policy. Return a concise intake checklist for the missing configuration and documents you need before the review can be completed. Include a recommended report structure, assumptions, risks, and next steps.

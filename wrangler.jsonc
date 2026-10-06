@@ -1,0 +1,14 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "bulk-invoice-contract-review-agent",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-10-06",
+  "observability": {
+    "enabled": true
+  },
+  "vars": {
+    "OPENAI_PROJECT": "proj_mRsQVx3NjOamxeXH6UrLowoC",
+    "OPENAI_BASE_URL": "https://api.openai.com/v1",
+    "AGENTS_ENVIRONMENT_TYPE": "openai_hosted"
+  }
+}

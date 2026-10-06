@@ -1,0 +1,17 @@
+{
+  "name": "bulk-invoice-contract-review-agent",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "run:agent": "bash scripts/run-agent-session.sh",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^5.20261006.1",
+    "typescript": "^5.9.3",
+    "wrangler": "^4.42.0"
+  }
+}
