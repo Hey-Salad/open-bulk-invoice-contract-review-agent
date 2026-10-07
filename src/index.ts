@@ -1,11 +1,11 @@
+import { DurableObject } from "cloudflare:workers";
 import agentDefinition from "../config/agent-definition.json";
 
-interface Env {
-  OPENAI_API_KEY: string;
-  OPENAI_PROJECT: string;
-  OPENAI_BASE_URL: string;
-  AGENTS_ENVIRONMENT_TYPE: string;
-}
+export const WORKER_NAME = "open-bulk-invoice-contract-review-agent";
+export const MIN_SESSION_AUTH_SECRET_LENGTH = 32;
+export const GLOBAL_SESSION_LIMIT = 10;
+export const GLOBAL_SESSION_WINDOW_MS = 60_000;
+const GLOBAL_SESSION_OBJECT_NAME = "global";
 
 type AgentCreateResponse = {
   id?: string;
@@ -13,6 +13,53 @@ type AgentCreateResponse = {
 };
 
 const DEFAULT_INPUT = "Please start a bulk invoice and contract review setup check.\n\nWe have not uploaded the invoice PDFs, contract PDFs, policy document, purchase orders, or payment records yet.\n\nUse live web search only if useful for general review best practices, not to invent our internal policy. Return a concise intake checklist for the missing configuration and documents you need before the review can be completed. Include a recommended report structure, assumptions, risks, and next steps.";
+
+export class GlobalSessionLimiter extends DurableObject<Env> {
+  constructor(ctx: DurableObjectState, env: Env) {
+    super(ctx, env);
+    ctx.blockConcurrencyWhile(async () => {
+      this.ctx.storage.sql.exec(`
+        CREATE TABLE IF NOT EXISTS session_window (
+          id INTEGER PRIMARY KEY,
+          window_start INTEGER NOT NULL,
+          count INTEGER NOT NULL
+        )
+      `);
+    });
+  }
+
+  allow(): { allowed: boolean; retryAfterSeconds: number } {
+    const now = Date.now();
+    const row = this.ctx.storage.sql
+      .exec<{ window_start: number; count: number }>(
+        "SELECT window_start, count FROM session_window WHERE id = 1",
+      )
+      .toArray()[0];
+
+    let windowStart = now;
+    let count = 0;
+    if (row && now - row.window_start < GLOBAL_SESSION_WINDOW_MS) {
+      windowStart = row.window_start;
+      count = row.count;
+    }
+
+    if (count >= GLOBAL_SESSION_LIMIT) {
+      const retryAfterMs = windowStart + GLOBAL_SESSION_WINDOW_MS - now;
+      return {
+        allowed: false,
+        retryAfterSeconds: Math.max(1, Math.ceil(retryAfterMs / 1000)),
+      };
+    }
+
+    this.ctx.storage.sql.exec(
+      `INSERT INTO session_window (id, window_start, count) VALUES (1, ?, ?)
+       ON CONFLICT(id) DO UPDATE SET window_start = excluded.window_start, count = excluded.count`,
+      windowStart,
+      count + 1,
+    );
+    return { allowed: true, retryAfterSeconds: 0 };
+  }
+}
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
@@ -23,7 +70,7 @@ export default {
     }
 
     if (request.method === "GET" && url.pathname === "/health") {
-      return jsonResponse({ ok: true, service: "bulk-invoice-contract-review-agent" });
+      return jsonResponse({ ok: true, service: WORKER_NAME });
     }
 
     if (request.method === "POST" && url.pathname === "/api/sessions") {
@@ -32,10 +79,59 @@ export default {
 
     return jsonResponse({ error: "Not found" }, 404);
   },
-};
+} satisfies ExportedHandler<Env>;
+
+export function sessionAttemptKey(request: Request): string {
+  const ip = request.headers.get("CF-Connecting-IP");
+  if (ip == null || ip.length === 0) return "ip:unknown";
+  return `ip:${ip}`;
+}
 
 async function createAndStreamSession(request: Request, env: Env): Promise<Response> {
+  const attempt = await env.SESSION_ATTEMPT_LIMITER.limit({ key: sessionAttemptKey(request) });
+  if (!attempt.success) {
+    logEvent("log", "session attempt limited", { path: "/api/sessions", code: "session_attempt_limited" });
+    return jsonResponse(
+      { error: "Too many session attempts.", code: "session_attempt_limited" },
+      429,
+      { "Retry-After": "60" },
+    );
+  }
+
+  if (!sessionAuthConfigured(env)) {
+    logEvent("error", "session auth unavailable", {
+      path: "/api/sessions",
+      code: "session_auth_unavailable",
+    });
+    return jsonResponse(
+      { error: "Session authentication is unavailable.", code: "session_auth_unavailable" },
+      503,
+    );
+  }
+
+  const provided = bearerToken(request);
+  if (provided == null || !(await verifyToken(provided, env.SESSION_AUTH_SECRET))) {
+    logEvent("log", "session auth rejected", { path: "/api/sessions", code: "unauthorized" });
+    return jsonResponse({ error: "Unauthorized.", code: "unauthorized" }, 401);
+  }
+
+  const gate = env.GLOBAL_SESSION_LIMITER.getByName(GLOBAL_SESSION_OBJECT_NAME);
+  const decision = await gate.allow();
+  if (!decision.allowed) {
+    logEvent("log", "global session limit exceeded", { path: "/api/sessions", code: "session_global_limited" });
+    return jsonResponse(
+      {
+        error: "Global session limit exceeded.",
+        code: "session_global_limited",
+        retry_after_seconds: decision.retryAfterSeconds,
+      },
+      429,
+      { "Retry-After": String(decision.retryAfterSeconds) },
+    );
+  }
+
   if (!env.OPENAI_API_KEY) {
+    logEvent("error", "openai api key missing", { path: "/api/sessions" });
     return jsonResponse({ error: "OPENAI_API_KEY secret is not configured." }, 500);
   }
 
@@ -120,6 +216,27 @@ async function createAndStreamSession(request: Request, env: Env): Promise<Respo
   });
 }
 
+function sessionAuthConfigured(env: Env): boolean {
+  return typeof env.SESSION_AUTH_SECRET === "string" && env.SESSION_AUTH_SECRET.length >= MIN_SESSION_AUTH_SECRET_LENGTH;
+}
+
+function bearerToken(request: Request): string | null {
+  const header = request.headers.get("Authorization");
+  if (header == null) return null;
+  const prefix = "Bearer ";
+  if (!header.startsWith(prefix)) return null;
+  return header.slice(prefix.length);
+}
+
+async function verifyToken(provided: string, expected: string): Promise<boolean> {
+  const encoder = new TextEncoder();
+  const [providedHash, expectedHash] = await Promise.all([
+    crypto.subtle.digest("SHA-256", encoder.encode(provided)),
+    crypto.subtle.digest("SHA-256", encoder.encode(expected)),
+  ]);
+  return crypto.subtle.timingSafeEqual(providedHash, expectedHash);
+}
+
 function apiBase(env: Env): string {
   return (env.OPENAI_BASE_URL || "https://api.openai.com/v1").replace(/\/$/, "");
 }
@@ -139,6 +256,7 @@ function openAiHeaders(env: Env): HeadersInit {
 
 async function openAiError(action: string, response: Response): Promise<Response> {
   const body = await response.text();
+  logEvent("error", "openai request failed", { action, status: response.status });
   return jsonResponse(
     {
       error: `Failed to ${action}.`,
@@ -149,11 +267,16 @@ async function openAiError(action: string, response: Response): Promise<Response
   );
 }
 
-function jsonResponse(body: unknown, status = 200): Response {
-  return new Response(JSON.stringify(body, null, 2), {
-    status,
-    headers: { "Content-Type": "application/json; charset=utf-8" },
-  });
+function logEvent(level: "log" | "error", message: string, fields: Record<string, string | number>): void {
+  const line = JSON.stringify({ message, ...fields });
+  if (level === "error") console.error(line);
+  else console.log(line);
+}
+
+function jsonResponse(body: unknown, status = 200, extraHeaders?: HeadersInit): Response {
+  const headers = new Headers(extraHeaders);
+  headers.set("Content-Type", "application/json; charset=utf-8");
+  return new Response(JSON.stringify(body, null, 2), { status, headers });
 }
 
 function htmlResponse(body: string): Response {
@@ -212,17 +335,23 @@ function renderHome(): string {
       font-weight: 650;
       margin-bottom: 10px;
     }
-    textarea {
+    textarea, input[type="password"] {
       box-sizing: border-box;
       width: 100%;
-      min-height: 430px;
-      resize: vertical;
       padding: 14px;
       border: 1px solid #c9d1dc;
       border-radius: 8px;
       background: #ffffff;
       color: inherit;
       font: 14px/1.45 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    }
+    textarea {
+      min-height: 430px;
+      resize: vertical;
+    }
+    input[type="password"] {
+      min-height: 42px;
+      margin-bottom: 12px;
     }
     button {
       margin-top: 12px;
@@ -267,10 +396,12 @@ function renderHome(): string {
 <body>
   <header>
     <h1>Bulk Invoice and Contract Review</h1>
-    <p>Create a reusable OpenAI Agents API invoice and contract reviewer, start an OpenAI-hosted session from its returned agent ID, and stream raw session events.</p>
+    <p>Create a reusable OpenAI Agents API invoice and contract reviewer, start an OpenAI-hosted session from its returned agent ID, and stream raw session events. Session creation requires the operator auth token.</p>
   </header>
   <main>
     <form id="agent-form">
+      <label for="auth">Session auth token</label>
+      <input id="auth" name="auth" type="password" autocomplete="off" spellcheck="false">
       <label for="input">Initial user message</label>
       <textarea id="input" name="input">${escapeHtml(DEFAULT_INPUT)}</textarea>
       <button id="run" type="submit">Start review session</button>
@@ -290,9 +421,11 @@ function renderHome(): string {
       output.textContent = "Starting session...\\n";
 
       try {
+        const headers = { "Content-Type": "application/json" };
+        if (form.auth.value) headers.Authorization = "Bearer " + form.auth.value;
         const response = await fetch("/api/sessions", {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
+          headers,
           body: JSON.stringify({ input: form.input.value })
         });
 

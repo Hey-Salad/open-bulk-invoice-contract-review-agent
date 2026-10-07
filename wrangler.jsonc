@@ -1,14 +1,53 @@
 {
   "$schema": "./node_modules/wrangler/config-schema.json",
-  "name": "bulk-invoice-contract-review-agent",
+  // Distinct from the private bulk-invoice-contract-review-agent Worker.
+  // Deploying that name from this public repo would replace the private Worker.
+  "name": "open-bulk-invoice-contract-review-agent",
   "main": "src/index.ts",
   "compatibility_date": "2026-10-06",
   "observability": {
-    "enabled": true
+    "enabled": true,
+    "logs": {
+      "enabled": true,
+      "head_sampling_rate": 1
+    },
+    "traces": {
+      "enabled": true,
+      "head_sampling_rate": 0.01
+    }
   },
   "vars": {
     "OPENAI_PROJECT": "proj_mRsQVx3NjOamxeXH6UrLowoC",
     "OPENAI_BASE_URL": "https://api.openai.com/v1",
     "AGENTS_ENVIRONMENT_TYPE": "openai_hosted"
-  }
+  },
+  "secrets": {
+    "required": ["OPENAI_API_KEY", "SESSION_AUTH_SECRET"]
+  },
+  // Account-local rate-limit namespace for this public Worker only.
+  // A shared namespace_id would share counters with another Worker.
+  "ratelimits": [
+    {
+      "name": "SESSION_ATTEMPT_LIMITER",
+      "namespace_id": "21015",
+      "simple": {
+        "limit": 10,
+        "period": 60
+      }
+    }
+  ],
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "GLOBAL_SESSION_LIMITER",
+        "class_name": "GlobalSessionLimiter"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["GlobalSessionLimiter"]
+    }
+  ]
 }
