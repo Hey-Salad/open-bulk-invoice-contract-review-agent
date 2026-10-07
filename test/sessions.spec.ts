@@ -1,12 +1,13 @@
 import { env } from "cloudflare:workers";
 import { createExecutionContext, reset, runInDurableObject, waitOnExecutionContext } from "cloudflare:test";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import worker, {
+import worker from "../src/index";
+import {
   GLOBAL_SESSION_LIMIT,
   MIN_SESSION_AUTH_SECRET_LENGTH,
   WORKER_NAME,
   sessionAttemptKey,
-} from "../src/index";
+} from "../src/session-policy";
 import { SESSION_ATTEMPT_LIMIT, TEST_SESSION_AUTH_SECRET } from "./constants";
 
 const IncomingRequest = Request<unknown, IncomingRequestCfProperties>;
